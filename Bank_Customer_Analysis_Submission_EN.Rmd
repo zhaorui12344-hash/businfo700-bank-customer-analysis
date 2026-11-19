@@ -1,0 +1,886 @@
+---
+title: "Retail Bank Customer Segmentation and CLV Analysis"
+subtitle: "Submission Report"
+output:
+  html_notebook:
+    toc: true
+    toc_depth: 2
+---
+
+# Executive overview
+
+This analysis examines 10,000 customer records to describe current profitability, segment customer relationships and explain recorded Customer Lifetime Value (CLV). It combines data-quality checks, bivariate exploration, four-cluster K-means segmentation and an interpretable CLV regression. The original data and outcome values are retained.
+
+Four segments distinguish product breadth, activity and life stage. Older low-activity customers have the highest mean current profit, while multi-product active customers have the highest mean recorded CLV. Regression predicts recorded labels better than a training-mean baseline on held-out records, but residual problems and an unknown CLV formula limit interpretation. Findings support small, measurable pilots rather than automatic individual decisions.
+
+The analysis does not establish that younger customers' true lifetime value is underestimated. No actual future-profit benchmark is available. Results describe associations, not causal returns from changing customer behaviour.
+
+# Analysis responsibilities
+
+| Member | Area | Inclusive chunk range |
+|---|---|---|
+| 1 | Data cleaning and quality | `setup` to `age-mapping` |
+| 2 | Exploratory and bivariate analysis | `clv-correlations` to `young-correlation` |
+| 3 | Clustering and solution selection | `cluster-inputs` to `sensitivity-no-capping` |
+| 4 | Cluster profiling and interpretation | `selected-clusters` to `cluster-scatter` |
+| 5 | Predictive modelling | `train-validation` to `age-errors` |
+| 6 | Business recommendations and integration | `profit-ranking` to `session`, including the recommendation narrative |
+
+Run all chunks in order in a fresh session. Open the project Rproj so the relative data path resolves correctly. Responsibilities define contributions; later blocks use objects created earlier.
+
+# 1. Data cleaning and quality checks
+
+## 1.1 Environment setup
+
+Set display options and load the package used to calculate silhouette widths. If necessary, install cluster once using the commented command.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 7, fig.height = 5)
+options(digits = 5)
+# install.packages("cluster")
+library(cluster)
+```
+
+**Result and interpretation:** The environment is ready for the following analysis.
+
+## 1.2 Load the original data
+
+Read the unmodified CSV from the project data directory and create a working copy. Open the project Rproj before running individual chunks.
+
+```{r read-data}
+data_path <- "data/Group_presentation.csv"
+raw_data <- read.csv(data_path)
+bank <- raw_data
+head(bank)
+```
+
+**Result and interpretation:** The file contains `r nrow(raw_data)` customer records and `r ncol(raw_data)` original variables. The original object is preserved.
+
+## 1.3 Inspect size and structure
+
+Inspect dimensions, names and storage types before transforming variables.
+
+```{r size}
+dim(bank)
+names(bank)
+str(bank)
+```
+
+**Result and interpretation:** The seven original columns are stored as integers; their statistical meanings differ. No customer identifier is available.
+
+## 1.4 Assign measurement levels
+
+Distinguish counts, numeric outcomes and ordinal age categories. Keep all six permitted age codes even if a category is absent.
+
+```{r types}
+variable_types <- data.frame(
+  Variable = names(raw_data),
+  Type = c("Count", "Numeric", "Count", "Ordinal category",
+           "Numeric age", "Numeric current profit", "Derived numeric outcome")
+)
+variable_types
+bank$Cat_Age <- factor(bank$Cat_Age, levels = 1:6, ordered = TRUE)
+table(bank$Cat_Age)
+```
+
+**Result and interpretation:** Products and transactions are counts; age is numeric; Cat_Age is ordinal. Observed categories are 2–6. Yield is current profit and CLV is a derived label.
+
+## 1.5 Describe the variables
+
+Report means, medians, standard deviations and ranges. Use percentages for age categories rather than averaging codes.
+
+```{r summary}
+numeric_vars <- c("Tot_Prod", "Income", "No_Trans", "Age", "Yield", "CLV")
+summary(bank)
+summary_table <- data.frame(
+  Variable = numeric_vars,
+  Mean = sapply(bank[numeric_vars], mean),
+  Median = sapply(bank[numeric_vars], median),
+  SD = sapply(bank[numeric_vars], sd),
+  Min = sapply(bank[numeric_vars], min),
+  Max = sapply(bank[numeric_vars], max)
+)
+summary_table
+prop.table(table(bank$Cat_Age)) * 100
+```
+
+**Result and interpretation:** Mean Yield is $`r round(mean(bank$Yield),2)` versus median $`r median(bank$Yield)`. Mean CLV is $`r round(mean(bank$CLV),2)` versus median $`r median(bank$CLV)`. Differences between means and medians motivate inspecting skewness.
+
+## 1.6 Check missing values and ranges
+
+Check explicit missingness and valid domains: products 0–5, age 18–99 and age codes 1–6. Transactions must be nonnegative integers.
+
+```{r missing-range}
+colSums(is.na(bank))
+range_checks <- c(
+  Invalid_products = sum(!raw_data$Tot_Prod %in% 0:5),
+  Negative_income = sum(raw_data$Income < 0),
+  Invalid_transactions = sum(raw_data$No_Trans < 0 | raw_data$No_Trans %% 1 != 0),
+  Age_outside_brief = sum(raw_data$Age < 18 | raw_data$Age > 99),
+  Invalid_age_code = sum(!raw_data$Cat_Age %in% 1:6)
+)
+range_checks
+```
+
+**Result and interpretation:** There are `r sum(is.na(bank))` explicit missing values and `r sum(range_checks)` range violations under these checks. Zero income still needs separate interpretation.
+
+## 1.7 Inspect repeated value combinations
+
+Count rows identical to earlier records and display all participating rows.
+
+```{r duplicates}
+sum(duplicated(raw_data))
+duplicate_rows <- duplicated(raw_data) | duplicated(raw_data, fromLast = TRUE)
+raw_data[duplicate_rows, ]
+```
+
+**Result and interpretation:** There are `r sum(duplicated(raw_data))` repeated rows after the first occurrences. Retain them because identical values do not prove duplicate customers without IDs.
+
+## 1.8 Investigate zero income
+
+Count zero-income records and check whether these customers transact. Compare group means.
+
+```{r zero-income}
+bank$Income_group <- factor(ifelse(bank$Income == 0, "Zero", "Positive"))
+c(Zero_income = sum(bank$Income == 0),
+  Zero_income_with_transactions = sum(bank$Income == 0 & bank$No_Trans > 0))
+table(bank$Income_group)
+aggregate(cbind(Age, Tot_Prod, No_Trans, Yield, CLV) ~ Income_group,
+          data = bank, FUN = mean)
+```
+
+**Result and interpretation:** There are `r sum(bank$Income == 0)` zero-income records, including `r sum(bank$Income == 0 & bank$No_Trans > 0)` with transactions. The zeros may represent true zero income, unreported income or missing-value codes; the data cannot distinguish them.
+
+## 1.9 Compare zero-income group medians
+
+Compare medians as a less extreme-sensitive complement to means and plot transaction distributions.
+
+```{r zero-medians}
+aggregate(cbind(Age, Tot_Prod, No_Trans, Yield, CLV) ~ Income_group,
+          data = bank, FUN = median)
+boxplot(No_Trans ~ Income_group, data = bank,
+        xlab = "Income group", ylab = "Transactions")
+```
+
+**Result and interpretation:** Customers with recorded zero income still exhibit banking activity. Keep the zeros in the main analysis and assess clustering without Income as a sensitivity check.
+
+## 1.10 Income distribution
+
+Display the complete range in a histogram so extreme records remain visible.
+
+```{r hist-income}
+hist(bank$Income, breaks = 40, main = "Distribution of Income",
+     xlab = "Income", col = "lightblue")
+```
+
+**Result and interpretation:** The distribution has a long right tail; a few large observations can affect averages and distances.
+
+## 1.11 Transactions distribution
+
+Display the complete range in a histogram so extreme records remain visible.
+
+```{r hist-no_trans}
+hist(bank$No_Trans, breaks = 40, main = "Distribution of No_Trans",
+     xlab = "No_Trans", col = "lightblue")
+```
+
+**Result and interpretation:** The distribution has a long right tail; a few large observations can affect averages and distances.
+
+## 1.12 Age distribution
+
+Display the complete range in a histogram so extreme records remain visible.
+
+```{r hist-age}
+hist(bank$Age, breaks = 40, main = "Distribution of Age",
+     xlab = "Age", col = "lightblue")
+```
+
+**Result and interpretation:** Ages span 18–99 and cover multiple life stages; high but plausible ages are retained.
+
+## 1.13 Current profit distribution
+
+Display the complete range in a histogram so extreme records remain visible.
+
+```{r hist-yield}
+hist(bank$Yield, breaks = 40, main = "Distribution of Yield",
+     xlab = "Yield", col = "lightblue")
+```
+
+**Result and interpretation:** The distribution has a long right tail; a few large observations can affect averages and distances. Negative values represent current losses and are retained.
+
+## 1.14 Recorded CLV distribution
+
+Display the complete range in a histogram so extreme records remain visible.
+
+```{r hist-clv}
+hist(bank$CLV, breaks = 40, main = "Distribution of CLV",
+     xlab = "CLV", col = "lightblue")
+```
+
+**Result and interpretation:** The distribution has a long right tail; a few large observations can affect averages and distances.
+
+## 1.15 Product ownership frequencies
+
+Display counts for each observed number of products.
+
+```{r products}
+table(bank$Tot_Prod)
+barplot(table(bank$Tot_Prod), xlab = "Products owned", ylab = "Customers",
+        main = "Product ownership", col = "lightblue")
+```
+
+**Result and interpretation:** Most customers hold few products. Observed counts run from 1 to 5, within the permitted 0–5 range.
+
+## 1.16 Screen distributions with boxplots
+
+Draw one boxplot per numeric variable to identify observations requiring investigation.
+
+```{r boxplots}
+for (variable in numeric_vars) {
+  boxplot(bank[[variable]], main = paste("Outlier check:", variable),
+          ylab = variable, col = "lightblue")
+}
+```
+
+**Result and interpretation:** Flags occur in skewed variables and discrete product counts. A point beyond a whisker is not automatically erroneous.
+
+## 1.17 Quantify outlier flags
+
+Count observations outside Q1 − 1.5×IQR and Q3 + 1.5×IQR and report P99 thresholds.
+
+```{r outlier-table}
+outlier_table <- data.frame()
+for (variable in numeric_vars) {
+  x <- bank[[variable]]
+  q1 <- unname(quantile(x, 0.25))
+  q3 <- unname(quantile(x, 0.75))
+  lower <- q1 - 1.5 * (q3 - q1)
+  upper <- q3 + 1.5 * (q3 - q1)
+  outlier_table <- rbind(outlier_table, data.frame(
+    Variable = variable, Minimum = min(x), Maximum = max(x),
+    P99 = unname(quantile(x, 0.99)),
+    Flagged = sum(x < lower | x > upper)))
+}
+outlier_table
+```
+
+**Result and interpretation:** Income P99 is `r round(quantile(bank$Income,.99),2)` and transaction P99 is `r round(quantile(bank$No_Trans,.99),2)`. Retain all original records and outcomes; cap these two inputs only in the clustering copy, and assess an uncapped alternative.
+
+## 1.18 Reconcile actual age and age categories
+
+Compare observed minimum/maximum ages by category, then verify inferred boundaries row by row.
+
+```{r age-mapping}
+aggregate(Age ~ Cat_Age, data = bank, FUN = min)
+aggregate(Age ~ Cat_Age, data = bank, FUN = max)
+expected_age_group <- cut(bank$Age, breaks = c(17, 35, 50, 64, 79, 99),
+                          labels = c(2, 3, 4, 5, 6))
+table(Recorded = bank$Cat_Age, Expected = expected_age_group, useNA = "ifany")
+sum(as.character(bank$Cat_Age) != as.character(expected_age_group))
+```
+
+**Result and interpretation:** The inferred bands 18–35, 36–50, 51–64, 65–79 and 80–99 agree with the recorded categories. Use Age in models and Cat_Age for profiles to avoid duplicated age information. These inferred bands are not an external dictionary.
+
+**End of Member 1 contribution.**
+
+# 2. Exploratory and bivariate analysis
+
+## 2.1 Explore CLV associations
+
+Calculate numeric correlations and plot CLV against each candidate explanatory variable.
+
+```{r clv-correlations}
+correlation_table <- round(cor(bank[numeric_vars]), 3)
+correlation_table
+for (variable in c("Tot_Prod", "Income", "No_Trans", "Age", "Yield")) {
+  plot(bank[[variable]], bank$CLV, xlab = variable, ylab = "CLV",
+       main = paste("CLV and", variable), pch = 16, col = rgb(0, 0, 0, 0.15))
+}
+```
+
+**Result and interpretation:** Income–CLV correlation is about 0.777; Yield–CLV is about 0.562. These associations motivate investigating possible reuse in the unknown CLV formula, but cannot identify that formula or establish causation.
+
+## 2.2 Test age–CLV linear association
+
+Test H0: population linear correlation is zero against a two-sided alternative.
+
+```{r age-correlation-test}
+cor.test(bank$Age, bank$CLV, alternative = "two.sided")
+```
+
+**Result and interpretation:** The overall age–CLV correlation is about 0.054: statistically detectable in a large sample but small. Magnitude and shape matter alongside the p-value.
+
+## 2.3 Describe customers under 30
+
+Define the group directly from Age < 30 and compare means and medians. Category 2 also includes ages 30–35 and is not a substitute.
+
+```{r young-summary}
+bank$Under_30 <- factor(ifelse(bank$Age < 30, "Under 30", "30 and above"),
+                        levels = c("Under 30", "30 and above"))
+table(bank$Under_30)
+aggregate(cbind(Income, No_Trans, Tot_Prod, Yield, CLV) ~ Under_30,
+          data = bank, FUN = mean)
+aggregate(cbind(Income, No_Trans, Tot_Prod, Yield, CLV) ~ Under_30,
+          data = bank, FUN = median)
+```
+
+**Result and interpretation:** Mean recorded CLV is approximately $1,246 for younger customers and $2,079 for others. Younger customers also have lower mean income, transactions and current profit.
+
+## 2.4 Compare recorded CLV by age group
+
+Use a boxplot and Welch t-test. H0: the two groups have equal mean recorded CLV; H1: they differ. Welch permits unequal variances, but independence and sampling assumptions still matter.
+
+```{r young-test}
+boxplot(CLV ~ Under_30, data = bank, xlab = "Age group", ylab = "Recorded CLV")
+young_test <- t.test(CLV ~ Under_30, data = bank)
+young_test
+```
+
+**Result and interpretation:** The difference is statistically significant. It does not establish underestimation: observed future profit and the original formula are unavailable, so no justified upward adjustment can be calculated.
+
+## 2.5 Inspect younger-customer associations
+
+Calculate the same correlations within customers under 30 to reveal subgroup patterns.
+
+```{r young-correlation}
+young_data <- bank[bank$Age < 30, ]
+round(cor(young_data[numeric_vars]), 3)
+```
+
+**Result and interpretation:** Within this subgroup, age–CLV correlation is about 0.435, compared with about 0.054 overall. Subgroup composition and the old formula may explain different patterns; this is not a causal result.
+
+**End of Member 2 contribution.**
+
+# 3. K-means clustering and solution selection
+
+## 3.1 Choose clustering inputs
+
+Use products for relationship breadth, income for income level, transactions for activity, and age for life stage. Exclude Yield, CLV and redundant Cat_Age. Inspect input correlations.
+
+```{r cluster-inputs}
+cluster_vars <- c("Tot_Prod", "Income", "No_Trans", "Age")
+cluster_data <- bank[cluster_vars]
+round(cor(cluster_data), 3)
+```
+
+**Result and interpretation:** Income and transactions have the largest input correlation, about 0.571. Four inputs offer distinct but partially related information; no outcome is used to compute distances.
+
+## 3.2 Limit extreme clustering distances
+
+Cap Income and No_Trans at their 99th percentiles only in a dedicated copy. This is an analytical choice rather than correction of proven errors.
+
+```{r cluster-capping}
+income_cap <- unname(quantile(cluster_data$Income, 0.99))
+transaction_cap <- unname(quantile(cluster_data$No_Trans, 0.99))
+cluster_data$Income <- pmin(cluster_data$Income, income_cap)
+cluster_data$No_Trans <- pmin(cluster_data$No_Trans, transaction_cap)
+data.frame(Variable = c("Income", "No_Trans"),
+           Cap = c(income_cap, transaction_cap),
+           Changed = c(sum(bank$Income > income_cap),
+                       sum(bank$No_Trans > transaction_cap)))
+```
+
+**Result and interpretation:** Each input has 100 values capped. Original values remain available for profiles, outcomes and regression. Fractional capped transaction values are computational inputs, not observed counts.
+
+## 3.3 Standardize clustering inputs
+
+Subtract each variable mean and divide by its standard deviation before Euclidean-distance clustering.
+
+```{r cluster-scaling}
+cluster_scaled <- scale(cluster_data)
+round(colMeans(cluster_scaled), 6)
+apply(cluster_scaled, 2, sd)
+```
+
+**Result and interpretation:** The transformed inputs have means near zero and standard deviations of one. Scaling does not remove correlation or imply equal business importance.
+
+## 3.4 Prepare a fixed silhouette sample
+
+Sample 2,000 records with a fixed seed to limit distance-matrix memory. Fit K-means on all records, but evaluate approximate silhouette on the same sample for every k.
+
+```{r silhouette-sample}
+set.seed(700)
+silhouette_rows <- sample(seq_len(nrow(bank)), size = 2000)
+silhouette_distances <- dist(cluster_scaled[silhouette_rows, ])
+```
+
+**Result and interpretation:** The comparison uses a reproducible sample-based silhouette, not an exact full-population calculation.
+
+## 3.5 Fit candidate K-means solutions
+
+Fit k=2–8 with multiple initializations and save each solution, sample silhouette and cluster sizes.
+
+```{r compare-k}
+cluster_models <- list()
+k_comparison <- data.frame()
+for (k in 2:8) {
+  set.seed(700)
+  km <- kmeans(cluster_scaled, centers = k, nstart = 25, iter.max = 100)
+  cluster_models[[as.character(k)]] <- km
+  silhouette_result <- silhouette(km$cluster[silhouette_rows], silhouette_distances)
+  k_comparison <- rbind(k_comparison, data.frame(
+    K = k, Silhouette = mean(silhouette_result[, 3]),
+    Smallest_cluster = min(table(km$cluster)),
+    Largest_cluster = max(table(km$cluster))))
+}
+k_comparison
+```
+
+**Result and interpretation:** k=2 has the highest sampled score, about 0.317; k=4 scores about 0.305. Profiles and practical distinctiveness are examined before selecting the solution.
+
+## 3.6 Compare silhouette scores visually
+
+Plot the candidate scores against k to inspect the tradeoff between separation and detail.
+
+```{r silhouette-plot}
+plot(k_comparison$K, k_comparison$Silhouette, type = "b",
+     xlab = "Number of clusters", ylab = "Sample-based mean silhouette",
+     main = "Compare K-means solutions")
+```
+
+**Result and interpretation:** None of these scores indicates strong separation. Customer segments overlap and should be interpreted as descriptive partitions.
+
+## 3.7 Inspect candidate numeric profiles
+
+Report sizes and original-scale means for all six numeric variables for each candidate. Yield and CLV are passive profile variables.
+
+```{r candidate-profiles}
+for (k in 2:8) {
+  cat("
+Number of clusters:", k, "
+")
+  groups <- cluster_models[[as.character(k)]]$cluster
+  print(table(groups))
+  print(aggregate(bank[numeric_vars], by = list(Cluster = groups), FUN = mean))
+}
+```
+
+**Result and interpretation:** Two groups merge younger and older lower-activity customers; four groups separate life stage and product breadth. Additional groups increase complexity without improving on the best two-group score.
+
+## 3.8 Inspect candidate age-category proportions
+
+Report within-cluster age-category percentages for every candidate solution.
+
+```{r candidate-categories}
+for (k in 2:8) {
+  cat("
+Number of clusters:", k, "
+")
+  groups <- cluster_models[[as.character(k)]]$cluster
+  print(round(prop.table(table(groups, bank$Cat_Age), margin = 1) * 100, 1))
+}
+```
+
+**Result and interpretation:** Age distributions help explain the candidate groups. The absent category 1 remains a zero column and is not treated as a numeric value.
+
+## 3.9 Select four clusters
+
+Select k=4 after weighing silhouette, sizes and candidate profiles. It sacrifices about 0.013 silhouette relative to k=2 while separating distinct age and product-breadth patterns.
+
+```{r select-final-clusters}
+chosen_k <- 4
+km_final <- cluster_models[[as.character(chosen_k)]]
+bank$Cluster <- factor(km_final$cluster)
+table(bank$Cluster)
+```
+
+**Result and interpretation:** The selected groups contain 2,145, 3,347, 2,653 and 1,855 customers. This is a profile-based business compromise, not the mathematical score winner.
+
+## 3.10 Assess sensitivity to excluding Income
+
+Refit four clusters without Income because its zero values are ambiguous. Compare labels using row proportions, not diagonal accuracy.
+
+```{r sensitivity-no-income}
+without_income <- scale(cluster_data[c("Tot_Prod", "No_Trans", "Age")])
+set.seed(700)
+km_without_income <- kmeans(without_income, centers = 4, nstart = 25, iter.max = 100)
+no_income_comparison <- table(Main = bank$Cluster, Without_income = km_without_income$cluster)
+no_income_comparison
+round(prop.table(no_income_comparison, 1), 3)
+```
+
+**Result and interpretation:** Row-maximum corresponding proportions are about 97.9%, 84.3%, 94.8% and 85.2%. Omitting Income changes the boundaries of groups 2 and 4 more noticeably.
+
+## 3.11 Assess sensitivity to retaining extremes
+
+Refit four clusters after scaling original uncapped inputs. Keep the main solution fixed.
+
+```{r sensitivity-no-capping}
+uncapped_scaled <- scale(bank[cluster_vars])
+set.seed(700)
+km_uncapped <- kmeans(uncapped_scaled, centers = 4, nstart = 25, iter.max = 100)
+uncapped_comparison <- table(Main = bank$Cluster, Uncapped = km_uncapped$cluster)
+uncapped_comparison
+round(prop.table(uncapped_comparison, 1), 3)
+table(km_uncapped$cluster)
+```
+
+**Result and interpretation:** Corresponding row-maximum proportions are about 99.0%, 97.1%, 98.3% and 93.0%. The broad structure remains, but preprocessing affects some assignments; labels should not automatically determine individual treatment.
+
+**End of Member 3 contribution.**
+
+# 4. Cluster profiling and interpretation
+
+## 4.1 Name the selected segments
+
+Assign descriptive names using active-variable profiles and report sizes and shares. Names refer only to observed characteristics, not inferred occupations.
+
+```{r selected-clusters}
+cluster_names <- c("Multi-product active", "Younger low-activity",
+                   "Older low-activity", "Single-product active")
+cluster_sizes <- data.frame(
+  Cluster = 1:4, Segment = cluster_names,
+  N = as.integer(table(bank$Cluster)),
+  Percent = as.numeric(prop.table(table(bank$Cluster))) * 100
+)
+cluster_sizes
+```
+
+**Result and interpretation:** Segments are Multi-product active (21.45%), Younger low-activity (33.47%), Older low-activity (26.53%) and Single-product active (18.55%). Recheck naming if data, seeds or preprocessing change.
+
+## 4.2 Profile all seven original variables
+
+Combine numeric means with names/sizes and calculate age-category percentages. Use original, uncapped outcomes.
+
+```{r final-profiles}
+cluster_means <- aggregate(bank[numeric_vars],
+                           by = list(Cluster = bank$Cluster), FUN = mean)
+cluster_profile <- merge(cluster_sizes, cluster_means, by = "Cluster")
+cluster_profile
+cluster_age_percent <- prop.table(table(bank$Cluster, bank$Cat_Age), 1) * 100
+round(cluster_age_percent, 1)
+```
+
+**Result and interpretation:** Cluster 1 has the highest mean CLV; Cluster 3 has the highest mean current Yield. Current profitability and recorded lifetime-value rankings differ.
+
+## 4.3 Inspect medians and loss rates
+
+Report outcome medians, loss proportions, under-30 proportions and zero-income proportions.
+
+```{r profile-risks}
+cluster_medians <- aggregate(cbind(Yield, CLV) ~ Cluster, data = bank, FUN = median)
+cluster_rates <- aggregate(
+  data.frame(Loss_rate = bank$Yield < 0, Under30_rate = bank$Age < 30,
+             Zero_income_rate = bank$Income == 0),
+  by = list(Cluster = bank$Cluster), FUN = mean)
+cluster_medians
+cluster_rates
+```
+
+**Result and interpretation:** Clusters 2 and 4 have negative median Yield and current-loss rates about 57.9% and 53.2%, despite positive mean Yield. Segment averages do not describe every customer.
+
+## 4.4 Compare mean profitability measures
+
+Plot current Yield and recorded CLV separately because the measures do not necessarily share a time horizon.
+
+```{r profit-plots}
+barplot(cluster_means$Yield, names.arg = cluster_means$Cluster,
+        xlab = "Cluster", ylab = "Mean current Yield ($)", col = "steelblue")
+barplot(cluster_means$CLV, names.arg = cluster_means$Cluster,
+        xlab = "Cluster", ylab = "Mean recorded CLV ($)", col = "darkseagreen")
+```
+
+**Result and interpretation:** Cluster 3 leads mean current Yield at about $282; Cluster 1 leads mean recorded CLV at about $3,234. Cluster 2 has the lowest mean of both measures.
+
+## 4.5 Inspect overlap in a two-dimensional view
+
+Plot age and transactions by cluster. This view supplements rather than replaces the four-dimensional profiles and silhouette.
+
+```{r cluster-scatter}
+plot(bank$Age, bank$No_Trans, col = bank$Cluster, pch = 16,
+     xlab = "Age", ylab = "Transactions", main = "Selected four-cluster solution")
+legend("topright", legend = paste("Cluster", 1:4), col = 1:4, pch = 16)
+```
+
+**Result and interpretation:** The plotted groups overlap. Differences in active variables are partly built into clustering and do not independently validate naturally occurring customer types.
+
+**End of Member 4 contribution.**
+
+# 5. Predictive modelling
+
+## 5.1 Create training and validation samples
+
+Use a reproducible random 70/30 split from original records. The primary model is CLV ~ Tot_Prod + No_Trans + Age. Exclude Income because zeros are ambiguous and it may mechanically enter the old formula; exclude Yield for the same formula-reuse concern. Do not include redundant Cat_Age or full-data cluster labels.
+
+```{r train-validation}
+set.seed(700)
+train_rows <- sample(seq_len(nrow(raw_data)), size = floor(0.7 * nrow(raw_data)))
+train_data <- raw_data[train_rows, ]
+validation_data <- raw_data[-train_rows, ]
+c(Training = nrow(train_data), Validation = nrow(validation_data))
+```
+
+**Result and interpretation:** There are 7,000 training and 3,000 validation records. The reduced model sacrifices information for an interpretable association baseline; remaining predictors may also enter the old CLV formula. IDs are unavailable, so distinct rows are not verified distinct customers.
+
+## 5.2 Fit the CLV regression
+
+Fit an additive linear model on training records. For each coefficient, H0 is zero conditional on the other inputs; the overall F-test tests all three slopes jointly. A small regression provides directly interpretable associations, without claiming superiority over every nonlinear alternative.
+
+```{r fit-regression}
+clv_model <- lm(CLV ~ Tot_Prod + No_Trans + Age, data = train_data)
+summary(clv_model)
+```
+
+**Result and interpretation:** Training R² is about 0.494 and adjusted R² about 0.493. All three conventional coefficient p-values are small, but diagnostic weaknesses below limit inferential claims.
+
+## 5.3 Interpret coefficient estimates
+
+Report coefficients and conventional confidence intervals in original units.
+
+```{r coefficients}
+coefficient_table <- summary(clv_model)$coefficients
+coefficient_table
+confint(clv_model)
+coef(clv_model)
+```
+
+**Result and interpretation:** Holding other inputs constant, one more product is associated with about $652 higher recorded CLV, 100 transactions with about $495, and ten years of age with about $88. These are not causal profit increments; intervals rely on model assumptions.
+
+## 5.4 Compare conditional association strengths
+
+Fit the same model after standardizing the training outcome and predictors. Compare coefficients on a common scale.
+
+```{r standardized-coefficients}
+standardized_train <- as.data.frame(scale(train_data[c("CLV", "Tot_Prod", "No_Trans", "Age")]))
+standardized_model <- lm(CLV ~ Tot_Prod + No_Trans + Age, data = standardized_train)
+standardized_coefficients <- coef(standardized_model)[-1]
+sort(abs(standardized_coefficients), decreasing = TRUE)
+```
+
+**Result and interpretation:** Standardized coefficients are about 0.565 for transactions, 0.281 for products and 0.112 for age. This ranks included associations, not all possible CLV drivers.
+
+## 5.5 Check linear predictor redundancy
+
+Regress each input on the other two and calculate VIF = 1/(1 − R²).
+
+```{r vif}
+products_model <- lm(Tot_Prod ~ No_Trans + Age, data = train_data)
+transactions_model <- lm(No_Trans ~ Tot_Prod + Age, data = train_data)
+age_model <- lm(Age ~ Tot_Prod + No_Trans, data = train_data)
+vif_values <- c(
+  Tot_Prod = 1 / (1 - summary(products_model)$r.squared),
+  No_Trans = 1 / (1 - summary(transactions_model)$r.squared),
+  Age = 1 / (1 - summary(age_model)$r.squared)
+)
+vif_values
+```
+
+**Result and interpretation:** VIF values are close to one, indicating limited linear multicollinearity. This does not resolve residual or label-quality problems.
+
+## 5.6 Residuals versus fitted values
+
+Inspect whether residuals scatter around zero without trends or extreme deviations.
+
+```{r diagnostic-1}
+plot(clv_model, which = 1)
+```
+
+**Result and interpretation:** Several very large positive residuals are visible. The model substantially underpredicts some high recorded CLV values.
+
+## 5.7 Residual normality
+
+Compare residual quantiles with the normal reference line. This assesses errors rather than requiring normal predictors.
+
+```{r diagnostic-2}
+plot(clv_model, which = 2)
+```
+
+**Result and interpretation:** The right tail departs markedly from the line. Normal-error assumptions are not well supported.
+
+## 5.8 Residual variance
+
+Inspect the Scale-Location plot for a flat trend and roughly constant spread.
+
+```{r diagnostic-3}
+plot(clv_model, which = 3)
+```
+
+**Result and interpretation:** The spread changes with fitted values. Equal variance is questionable, so conventional standard errors and p-values require caution.
+
+## 5.9 Leverage and influence
+
+Inspect combinations of unusual predictor values and large residuals. Plot labels are source row names, not customer identifiers.
+
+```{r diagnostic-5}
+plot(clv_model, which = 5)
+```
+
+**Result and interpretation:** Influential observations warrant investigation. Their presence alone does not justify deleting genuine high-value customers.
+
+## 5.10 Assess dependence on the most influential record
+
+Temporarily refit after omitting the training observation with the largest Cook distance. Retain that record in the main model and original data.
+
+```{r influence-sensitivity}
+cook_values <- cooks.distance(clv_model)
+most_influential <- which.max(cook_values)
+train_data[most_influential, ]
+sensitivity_model <- lm(CLV ~ Tot_Prod + No_Trans + Age,
+                        data = train_data[-most_influential, ])
+cbind(Main = coef(clv_model), Without_one = coef(sensitivity_model))
+```
+
+**Result and interpretation:** The record is source row 2862 with CLV $55,306 and Yield $50,947. Coefficient signs persist; the transaction coefficient moves from about 4.95 to 4.84. One-record sensitivity does not resolve every diagnostic issue.
+
+## 5.11 Predict held-out records
+
+Keep the model fixed and predict validation labels. Retain all original validation CLV values.
+
+```{r validation-predictions}
+validation_prediction <- predict(clv_model, newdata = validation_data)
+training_prediction <- predict(clv_model, newdata = train_data)
+head(data.frame(Actual = validation_data$CLV, Predicted = validation_prediction))
+```
+
+**Result and interpretation:** Predictions estimate existing recorded labels for records excluded from fitting; they do not validate true future profits.
+
+## 5.12 Evaluate prediction errors
+
+Compare training/validation RMSE and MAE against a baseline that predicts the training mean. Calculate validation R² separately.
+
+```{r model-performance}
+baseline_prediction <- rep(mean(train_data$CLV), nrow(validation_data))
+performance <- data.frame(
+  Model = c("Training regression", "Validation regression", "Validation mean baseline"),
+  RMSE = c(sqrt(mean((train_data$CLV - training_prediction)^2)),
+           sqrt(mean((validation_data$CLV - validation_prediction)^2)),
+           sqrt(mean((validation_data$CLV - baseline_prediction)^2))),
+  MAE = c(mean(abs(train_data$CLV - training_prediction)),
+          mean(abs(validation_data$CLV - validation_prediction)),
+          mean(abs(validation_data$CLV - baseline_prediction)))
+)
+performance
+validation_r_squared <- 1 - sum((validation_data$CLV - validation_prediction)^2) /
+  sum((validation_data$CLV - mean(validation_data$CLV))^2)
+validation_r_squared
+```
+
+**Result and interpretation:** Validation RMSE is about $909 and MAE $498, versus baseline RMSE about $1,360. Validation R² is about 0.551. Lower validation than training RMSE reflects different extreme-value composition and does not guarantee future performance.
+
+## 5.13 Inspect actual versus predicted CLV
+
+Plot predictions against original validation CLV and display a perfect-prediction line. Count negative predictions without silently truncating them.
+
+```{r prediction-plot}
+plot(validation_data$CLV, validation_prediction,
+     xlab = "Actual recorded CLV", ylab = "Predicted CLV", pch = 16,
+     col = rgb(0, 0, 0, 0.2), main = "Validation predictions")
+abline(a = 0, b = 1, col = "red")
+sum(validation_prediction < 0)
+```
+
+**Result and interpretation:** There are `r sum(validation_prediction < 0)` negative predictions. Large high-CLV misses remain, reinforcing that this baseline is not ready for automatic individual treatment.
+
+## 5.14 Compare prediction errors by age group
+
+Define error as recorded CLV minus predicted CLV and compare mean error and mean absolute error by age group.
+
+```{r age-errors}
+validation_errors <- data.frame(
+  Age_group = ifelse(validation_data$Age < 30, "Under 30", "30 and above"),
+  Error = validation_data$CLV - validation_prediction,
+  Absolute_error = abs(validation_data$CLV - validation_prediction))
+aggregate(cbind(Error, Absolute_error) ~ Age_group, data = validation_errors, FUN = mean)
+```
+
+**Result and interpretation:** Mean error is about −$116 under age 30 and +$49 for others. This indicates overprediction of younger customers’ existing labels, not independent evidence that their true future value is underestimated.
+
+**End of Member 5 contribution.**
+
+# 6. Business recommendations and final integration
+
+## 6.1 Rank segment profitability
+
+Rank segments separately by current Yield and recorded CLV, then review medians and loss rates.
+
+```{r profit-ranking}
+cluster_profile[order(-cluster_profile$Yield),
+                c("Cluster", "Segment", "N", "Yield", "CLV")]
+cluster_profile[order(-cluster_profile$CLV),
+                c("Cluster", "Segment", "N", "Yield", "CLV")]
+cluster_medians
+cluster_rates
+```
+
+**Result and interpretation:** Older low-activity customers lead mean current Yield; Multi-product active customers lead mean CLV. Younger low-activity customers have the lowest means. Recommendations below combine these profiles with regression evidence.
+
+## 4.2 Executive interpretation
+
+**Highest current profit:** Cluster 3, Older low-activity, with mean Yield about $282 and median $116. **Highest recorded CLV:** Cluster 1, Multi-product active, at about $3,234. Cluster 2, Younger low-activity, has the lowest means for both outcomes: Yield about $55 and CLV about $1,077, with about 57.9% currently loss-making. Cluster 4, Single-product active, has mean CLV about $2,644 but median Yield −$13 and about 53.2% currently loss-making.
+
+Current profitability and the old formula's lifetime-value estimate are different. No segment has negative mean Yield, yet a majority of customers in some segments lose money currently. Present means alongside loss rates.
+
+Transactions, product count and age all have positive conditional associations with recorded CLV, in descending standardized strength. These suggest pilots, not a claim that increasing transactions or selling one product causes $652 of extra profit.
+
+## 4.3 Actions linked to both segments and model evidence
+
+| Action | Segment and profile evidence | Model evidence and limit | Implementation and evaluation |
+|---|---|---|---|
+| Pilot relevant cross-selling | Cluster 4: 1,855 customers, exactly one product each, about 409 transactions and $2,644 mean recorded CLV | Product coefficient about +$652; transactions have the strongest standardized association. These motivate needs research, not causal revenue estimates | Interview customers, then randomly invite a small eligible group. Compare acceptance, incremental net profit and complaints |
+| Maintain active multi-product relationships | Cluster 1: 2,145 customers, 2.32 products and 397 transactions on average; highest mean CLV | Product breadth and activity are positively associated with CLV. There is no churn label, so this is not a high-churn-risk classification | Pilot service check-ins and relevant reminders. Track retention, service costs and actual profits; avoid blanket subsidies |
+| Verify younger customers' income data and offer low-cost development support | Cluster 2: 3,347 customers; 44.2% under 30, 35.4% zero income, lower activity | Age has the weakest standardized association. The regression overpredicts younger customers' recorded labels by about $116 on average, so it cannot validate their true future potential | Clarify zero-income reasons and offer voluntary account-use support. Track subsequent actual profit, activity and fee burden; do not automatically raise fees or exclude low-CLV customers |
+| Protect current profit and review service costs | Cluster 3: 2,653 customers, mean age about 69; highest mean current Yield but lower CLV | Age is a weaker model association than activity and product breadth. Low activity does not imply low current profit; the CLV model cannot replace Yield evidence | Pilot optional service channels and relationship support, without mechanical age-based pricing. Evaluate net profit, satisfaction and service costs |
+
+Randomized pilots and incremental evaluation are proposed business experiments, not causal effects estimated by this analysis. The dataset lacks product-level holdings, churn, fees, service costs, tenure and future profit. It cannot support a specific product recommendation, churn probability or promised return.
+
+## 4.4 Limitations and next steps
+
+Request customer IDs, the Income definition and zero-value reasons, the old CLV formula/version history, product-level holdings, relationship duration, costs/fees, subsequent actual profits and churn. Clusters overlap and sensitivity choices may change assignments. Regression residuals violate ideal assumptions. Neither profiles nor coefficients establish causation. These limits distinguish useful exploratory evidence from a validated operating decision.
+
+
+## 6.2 Save reproducible analytical outputs
+
+Export profile tables, model performance and fitted objects. Retain scaling/capping parameters and the sampled row positions.
+
+```{r save-results}
+output_dir <- "outputs/submission"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+write.csv(bank, file.path(output_dir, "customer_profiles.csv"), row.names = FALSE)
+write.csv(summary_table, file.path(output_dir, "descriptive_statistics.csv"), row.names = FALSE)
+write.csv(outlier_table, file.path(output_dir, "outlier_screening.csv"), row.names = FALSE)
+write.csv(k_comparison, file.path(output_dir, "k_comparison.csv"), row.names = FALSE)
+write.csv(cluster_profile, file.path(output_dir, "cluster_profiles.csv"), row.names = FALSE)
+write.csv(cluster_age_percent, file.path(output_dir, "cluster_age_percent.csv"))
+write.csv(cluster_rates, file.path(output_dir, "cluster_rates.csv"), row.names = FALSE)
+write.csv(performance, file.path(output_dir, "prediction_performance.csv"), row.names = FALSE)
+saveRDS(list(model = clv_model, cluster_model = km_final,
+             cluster_center = attr(cluster_scaled, "scaled:center"),
+             cluster_sd = attr(cluster_scaled, "scaled:scale"),
+             income_cap = income_cap, transaction_cap = transaction_cap,
+             train_rows = train_rows, silhouette_rows = silhouette_rows,
+             no_income_comparison = no_income_comparison,
+             uncapped_comparison = uncapped_comparison),
+        file.path(output_dir, "analysis_objects.rds"))
+```
+
+**Result and interpretation:** Outputs are written to the report output directory. CSV files provide tables; the RDS file preserves fitted models and preprocessing parameters. No original CSV is overwritten.
+
+## 6.3 Verify data preservation and consistency
+
+Check the raw file, record counts, unchanged outcomes, clustering inputs, disjoint row indices and finite predictions.
+
+```{r final-checks}
+stopifnot(identical(raw_data, read.csv(data_path)))
+stopifnot(nrow(bank) == nrow(raw_data))
+stopifnot(identical(bank$Yield, raw_data$Yield), identical(bank$CLV, raw_data$CLV))
+stopifnot(!any(c("Yield", "CLV", "Cat_Age") %in% colnames(cluster_scaled)))
+stopifnot(sum(cluster_sizes$N) == nrow(bank))
+stopifnot(length(intersect(train_rows, setdiff(seq_len(nrow(raw_data)), train_rows))) == 0)
+stopifnot(all(is.finite(validation_prediction)))
+list.files(output_dir)
+```
+
+**Result and interpretation:** All checks must pass before the analysis is released. Row-index separation is not proof of customer-identity separation.
+
+## 6.4 Record software versions
+
+Record R and package versions for reproducibility.
+
+```{r session}
+sessionInfo()
+```
+
+**Result and interpretation:** The session information identifies the environment used. Rerun and review profiles if software versions or inputs change.
+
+**End of Member 6 contribution.**
+

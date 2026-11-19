@@ -1,0 +1,13 @@
+# Local sessions and generated outputs
+.DS_Store
+.RData
+.Rhistory
+.Rproj.user/
+.Ruserdata
+outputs/
+*.nb.html
+*_files/
+*_cache/
+figure/
+# Chinese study notebook stays local, as requested
+Bank_Customer_Analysis_Study_CN.Rmd
