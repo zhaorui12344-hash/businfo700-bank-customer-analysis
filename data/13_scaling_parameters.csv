@@ -1,0 +1,16 @@
+"File","Variable","Center","Scale","Fitted_rows"
+"04_cluster_scaled.csv","Tot_Prod",1.3613,0.615792359503593,10000
+"04_cluster_scaled.csv","Income",1225.8518,1036.12958519168,10000
+"04_cluster_scaled.csv","No_Trans",259.4125,156.649496859188,10000
+"04_cluster_scaled.csv","Age",47.2212,17.625632949023,10000
+"05_without_income_scaled.csv","Tot_Prod",1.3613,0.615792359503593,10000
+"05_without_income_scaled.csv","No_Trans",259.4125,156.649496859188,10000
+"05_without_income_scaled.csv","Age",47.2212,17.625632949023,10000
+"06_uncapped_scaled.csv","Tot_Prod",1.3613,0.615792359503593,10000
+"06_uncapped_scaled.csv","Income",1265.4078,1321.31684191144,10000
+"06_uncapped_scaled.csv","No_Trans",260.4585,160.425128019023,10000
+"06_uncapped_scaled.csv","Age",47.2212,17.625632949023,10000
+"09_standardized_train.csv","CLV",1907.43585714286,1396.94867779786,7000
+"09_standardized_train.csv","Tot_Prod",1.349,0.603413753827612,7000
+"09_standardized_train.csv","No_Trans",258.040285714286,159.311873341217,7000
+"09_standardized_train.csv","Age",47.341,17.7158318368372,7000
